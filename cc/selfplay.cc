@@ -119,6 +119,7 @@ DEFINE_int32(parallel_games, 32, "Number of games to play in parallel.");
 DEFINE_int32(num_games, 0,
              "Total number of games to play. Defaults to parallel_games. "
              "Only one of num_games and run_forever must be set.");
+DEFINE_int32(instance_id, 0, "Unique id with multi-instance.");
 
 // Output flags.
 DEFINE_string(output_dir, "",
@@ -241,7 +242,10 @@ class SelfPlayer {
       batcher_ =
           absl::make_unique<BatchingDualNetFactory>(std::move(model_factory));
     }
-    for (int i = 0; i < FLAGS_parallel_games; ++i) {
+    int instance_id = FLAGS_instance_id;
+    int thread_id_begin = instance_id * FLAGS_parallel_games;
+    for (int i = thread_id_begin;
+             i < thread_id_begin+FLAGS_parallel_games; ++i) {
       threads_.emplace_back(std::bind(&SelfPlayer::ThreadRun, this, i));
     }
     for (auto& t : threads_) {
