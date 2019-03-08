@@ -28,6 +28,12 @@ import subprocess
 import tensorflow as tf
 import time
 import utils
+import multiprocessing
+import fcntl
+import glob
+import threading
+import copy
+import time
 
 from absl import app, flags
 from rl_loop import example_buffer, fsdb
@@ -92,24 +98,143 @@ class State:
     return self.iter_num + 1
 
 
+def expand_flags(cmd, *args):
+  """Expand & dedup any flagfile command line arguments."""
+
+  # Read any flagfile arguments and expand them into a new list.
+  expanded = flags.FlagValues().read_flags_from_files(args)
+
+  # When one flagfile includes & overrides a base one, the expanded list may
+  # contain multiple instances of the same flag with different values.
+  # Deduplicate, always taking the last occurance of the flag.
+  deduped = OrderedDict()
+  deduped_vals = OrderedDict()
+  for arg in expanded:
+    argsplit = arg.split('=', 1)
+    flag = argsplit[0]
+    if flag in deduped.keys():
+      # in the case of --lr_rate and --lr_boundaries, same key might appear
+      # multiple times, make sure they all appear in command arg list
+      deduped[flag] += " {}".format(arg)
+    else:
+      deduped[flag] = arg
+    if len(argsplit) > 1:
+      deduped_vals[flag] = argsplit[1]
+  num_instance = 1
+  if '--multi-instance' in deduped_vals.keys():
+    # for multi-instance mode, num_games and parallel_games will be used to
+    # demine how many subprocs needed to run all the games on multiple processes
+    # or multiple computer nodes
+    if deduped_vals["--multi-instance"] == "True":
+      num_games = int(deduped_vals["--num_games"])
+      parallel_games = int(deduped_vals["--parallel_games"])
+      if num_games % parallel_games != 0:
+        logging.error('Error num_games must be multiply of %d', parallel_games)
+        raise RuntimeError('incompatible num_games/parallel_games combination')
+      num_instance = num_games/parallel_games
+      del(deduped['--num_games'])
+    del(deduped['--multi-instance'])
+  cmds = [cmd]+list(deduped.values())
+  return cmds, num_instance
+
+
 def checked_run(name, *cmd):
-  # Read & expand any flagfiles specified on the commandline so we can know
-  # exactly what's going on.
-  expanded = flags.FlagValues().read_flags_from_files(cmd)
-  logging.info('Running %s:\n  %s', name, '  '.join(expanded))
-
+  # Log the expanded & deduped list of command line arguments, so we can know
+  # exactly what's going on. Note that we don't pass the expanded list of
+  # arguments to the actual subprocess because of a quirk in how unknown flags
+  # are handled: unknown flags in flagfiles are silently ignored, while unknown
+  # flags on the command line will cause the subprocess to abort.
+  cmd, num_instance = expand_flags(*cmd)
+  logging.info('Running %s*%d:\n  %s', name, num_instance, '\n  '.join(cmd))
   with utils.logged_timer('%s finished' % name.capitalize()):
-    completed_process = subprocess.run(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    if completed_process.returncode:
-      logging.error('Error running %s: %s', name,
-                    completed_process.stdout.decode())
-      raise RuntimeError('Non-zero return code executing %s' % ' '.join(cmd))
-  return completed_process
+    # if num_instance == 0, use default behavior for GPU
+    if num_instance == 1:
+      try:
+        cmd = ' '.join(cmd)
+        completed_output = subprocess.check_output(
+          cmd, shell=True, stderr=subprocess.STDOUT)
+      except subprocess.CalledProcessError as err:
+        logging.error('Error running %s: %s', name, err.output.decode())
+        raise RuntimeError('Non-zero return code executing %s' % ' '.join(cmd))
+      logging.info(completed_output.decode())
+      return completed_output
+    else:
+      num_parallel_instance = int(multiprocessing.cpu_count())
+      procs=[None]*num_parallel_instance
+      results = [""]*num_parallel_instance
+      lines = [""]*num_parallel_instance
+      result=""
+
+      cur_instance = 0
+      # add new proc into procs
+      while cur_instance < num_instance or not all (
+          proc is None for proc in procs):
+        if None in procs and cur_instance < num_instance:
+          index = procs.index(None)
+          subproc_cmd = [
+                  'OMP_NUM_THREADS=1',
+                  'KMP_AFFINITY=granularity=fine,proclist=[{}],explicit'.format(
+                      ','.join(str(i) for i in list(range(
+                          index, index+1))))]
+          subproc_cmd = subproc_cmd + cmd
+          subproc_cmd = subproc_cmd + ['--instance_id={}'.format(cur_instance)]
+          subproc_cmd = ' '.join(subproc_cmd)
+          if (cur_instance == 0):
+            logging.info("subproc_cmd = {}".format(subproc_cmd))
+          procs[index] = subprocess.Popen(subproc_cmd, shell=True,
+                                          stdout=subprocess.PIPE,
+                                          stderr=subprocess.STDOUT)
+
+          proc_count = 0
+          for i in range(num_parallel_instance):
+            if procs[i] != None:
+              proc_count += 1
+          logging.debug('started instance {} in proc {}. proc count = {}'.format(
+              cur_instance, index, proc_count))
+
+          # change stdout of the process to non-blocking
+          # this is for collect output in a single thread
+          flags = fcntl.fcntl(procs[index].stdout, fcntl.F_GETFL)
+          fcntl.fcntl(procs[index].stdout, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+          cur_instance += 1
+        for index in range(num_parallel_instance):
+          if procs[index] != None:
+            # collect proc output
+            while True:
+              try:
+                line = procs[index].stdout.readline()
+                if line == b'':
+                  break
+                results[index] = results[index] + line.decode()
+              except IOError:
+                break
+
+            ret_val = procs[index].poll()
+            if ret_val == None:
+              continue
+            elif ret_val != 0:
+              logging.debug(results[index])
+              raise RuntimeError(
+                'Non-zero return code (%d) executing %s' % (
+                    ret_val, subproc_cmd))
+
+            result += results[index]
+            results[index] = ""
+            procs[index] = None
+
+            proc_count = 0
+            for i in range(num_parallel_instance):
+              if procs[i] != None:
+                proc_count += 1
+            logging.debug('proc {} finished. proc count = {}'.format(
+                index, proc_count))
+        time.sleep(0.001)  # avoid busy loop
+      return result.encode('utf-8')
 
 
-def get_lines(completed_process, slice):
-  return '\n'.join(completed_process.stdout.decode()[:-1].split('\n')[slice])
+def get_lines(completed_output, slice):
+  return '\n'.join(completed_output.decode()[:-1].split('\n')[slice])
 
 
 class MakeSlice(object):
@@ -167,7 +292,7 @@ def selfplay(state, flagfile='selfplay'):
 def train(state, tf_records):
   model_path = os.path.join(fsdb.models_dir(), state.train_model_name)
   checked_run('training',
-      'python3', 'train.py', *tf_records,
+      'python3', 'train.py', ' '.join(tf_records),
       '--flagfile={}'.format(os.path.join(FLAGS.flags_dir, 'train.flags')),
       '--work_dir={}'.format(fsdb.working_dir()),
       '--export_path={}'.format(model_path),
@@ -200,10 +325,15 @@ def evaluate_model(eval_model, target_model, sgf_dir, seed):
       '--model_two={}.pb'.format(target_model_path),
       '--sgf_dir={}'.format(sgf_dir),
       '--seed={}'.format(seed))
-  result = get_lines(result, make_slice[-7:])
+  result = result.decode()
   logging.info(result)
-  pattern = '{}\s+\d+\s+(\d+\.\d+)%'.format(eval_model)
-  win_rate = float(re.search(pattern, result).group(1)) * 0.01
+  pattern = '{}\s+(\d+)\s+\d+\.\d+%\s+(\d+)\s+\d+\.\d+%\s+(\d+)'.format(
+            eval_model)
+  matches = re.findall(pattern, result)
+  total = 0
+  for i in range(len(matches)):
+    total += int(matches[i][0])
+  win_rate = total * 0.01
   logging.info('Win rate %s vs %s: %.3f', eval_model, target_model, win_rate)
   return win_rate
 
