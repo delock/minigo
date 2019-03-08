@@ -187,7 +187,7 @@ def train(state, tf_records):
 def validate(state, holdout_glob):
   checked_run('validation',
       'python3', 'validate.py', holdout_glob,
-      '--flagfile={}'.format(os.path.join(FLAGS.flags_dir, 'train.flags')),
+      '--flagfile={}'.format(os.path.join(FLAGS.flags_dir, 'validate.flags')),
       '--work_dir={}'.format(fsdb.working_dir()))
 
 

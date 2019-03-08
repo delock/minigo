@@ -1,0 +1,10 @@
+# Flags for playing games.
+
+# This flagfile serves as the base for the boostrap & eval & selfplay stages of
+# the RL loop.
+
+--engine=tf
+--num_readouts=160
+--virtual_losses=8
+--value_init_penalty=2
+--resign_threshold=-0.99
