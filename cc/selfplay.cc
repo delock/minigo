@@ -133,6 +133,9 @@ DEFINE_string(output_bigtable, "",
 DEFINE_string(sgf_dir, "",
               "SGF directory for selfplay and puzzles. If empty in selfplay "
               "mode, no SGF is written.");
+DEFINE_bool(sgf_timestamp, true,
+              "If true, use timestamp as directory name when writing sgf"
+              "files.");
 DEFINE_string(bigtable_tag, "", "Used in Bigtable metadata");
 
 namespace minigo {
@@ -276,6 +279,7 @@ class SelfPlayer {
       output_dir = FLAGS_output_dir;
       holdout_dir = FLAGS_holdout_dir;
       sgf_dir = FLAGS_sgf_dir;
+      sgf_timestamp = FLAGS_sgf_timestamp;
     }
 
     Game::Options game_options;
@@ -284,6 +288,7 @@ class SelfPlayer {
     std::string output_dir;
     std::string holdout_dir;
     std::string sgf_dir;
+    bool sgf_timestamp;
   };
 
   void ThreadRun(int thread_id) {
@@ -385,12 +390,14 @@ class SelfPlayer {
       game->AddComment(
           absl::StrCat("Inferences: ", player->GetModelsUsedForInference()));
       if (!thread_options.sgf_dir.empty()) {
-        WriteSgf(
-            GetOutputDir(now, file::JoinPath(thread_options.sgf_dir, "clean")),
-            output_name, *game, false);
-        WriteSgf(
-            GetOutputDir(now, file::JoinPath(thread_options.sgf_dir, "full")),
-            output_name, *game, true);
+        auto sgf_clean_dir = file::JoinPath(thread_options.sgf_dir, "clean");
+        auto sgf_full_dir = file::JoinPath(thread_options.sgf_dir, "full");
+        if (thread_options.sgf_timestamp) {
+          sgf_clean_dir = GetOutputDir(now, sgf_clean_dir);
+          sgf_full_dir = GetOutputDir(now, sgf_full_dir);
+        }
+        WriteSgf(sgf_clean_dir, output_name, *game, false);
+        WriteSgf(sgf_full_dir, output_name, *game, true);
       }
     }
 
