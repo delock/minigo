@@ -54,8 +54,16 @@ flags.DEFINE_string('flags_dir', None,
                     'files: bootstrap.flags, selfplay.flags, eval.flags, '
                     'train.flags.')
 
-flags.DEFINE_integer('window_size', 5,
+flags.DEFINE_integer('max_window_size', 5,
                      'Maximum number of recent selfplay rounds to train on.')
+
+flags.DEFINE_integer('slow_window_size', 5,
+                     'Window size after which the window starts growing by '
+                     '1 every slow_window_speed iterations of the RL loop.')
+
+flags.DEFINE_integer('slow_window_speed', 1,
+                     'Speed at which the training window increases in size '
+                     'once the window size passes slow_window_size.')
 
 FLAGS = flags.FLAGS
 
@@ -92,30 +100,11 @@ class State:
     return self.iter_num + 1
 
 
-def expand_flags(cmd, *args):
-  """Expand & dedup any flagfile command line arguments."""
-
-  # Read any flagfile arguments and expand them into a new list.
-  expanded = flags.FlagValues().read_flags_from_files(args)
-
-  # When one flagfile includes & overrides a base one, the expanded list may
-  # contain multiple instances of the same flag with different values.
-  # Deduplicate, always taking the last occurance of the flag.
-  deduped = OrderedDict()
-  for arg in expanded:
-    flag = arg.split('=', 1)[0]
-    deduped[flag] = arg
-  return deduped.values()
-
-
 def checked_run(name, *cmd):
-  # Log the expanded & deduped list of command line arguments, so we can know
-  # exactly what's going on. Note that we don't pass the expanded list of
-  # arguments to the actual subprocess because of a quirk in how unknown flags
-  # are handled: unknown flags in flagfiles are silently ignored, while unknown
-  # flags on the command line will cause the subprocess to abort.
-  logging.info(
-      'Running %s:\n  %s  %s', name, cmd[0], '  '.join(expand_flags(*cmd)))
+  # Read & expand any flagfiles specified on the commandline so we can know
+  # exactly what's going on.
+  expanded = flags.FlagValues().read_flags_from_files(cmd)
+  logging.info('Running %s:\n  %s', name, '  '.join(expanded))
 
   with utils.logged_timer('%s finished' % name.capitalize()):
     completed_process = subprocess.run(
@@ -220,7 +209,7 @@ def train(state, tf_records):
 def validate(state, holdout_glob):
   checked_run('validation',
       'python3', 'validate.py', holdout_glob,
-      '--flagfile={}'.format(os.path.join(FLAGS.flags_dir, 'train.flags')),
+      '--flagfile={}'.format(os.path.join(FLAGS.flags_dir, 'validate.flags')),
       '--work_dir={}'.format(fsdb.working_dir()))
 
 
@@ -284,16 +273,15 @@ def rl_loop():
     holdout_glob = os.path.join(fsdb.holdout_dir(), '%06d-*' % state.iter_num,
                                 '*')
 
-    # Train on shuffled game data from recent selfplay rounds, ignoring the
-    # random bootstrapping round.
-    # TODO(tommadams): potential improvments:
-    #   - "slow window": increment number of models in window by 1 every 2
-    #     generations.
-    #   - uniformly resample the window each iteration (see TODO in selfplay
-    #     for more info).
-    tf_records = get_golden_chunk_records(min(min(FLAGS.window_size,
-                                                  state.iter_num),
-                                                  competitive_iter_count))
+    # Calculate the window size from which we'll select training chunks.
+    window = 1 + state.iter_num
+    if window >= FLAGS.slow_window_size:
+      window = (FLAGS.slow_window_size +
+                (window - FLAGS.slow_window_size) // FLAGS.slow_window_speed)
+    window = min(min(window, FLAGS.max_window_size), competitive_iter_count)
+
+    # Train on shuffled game data from recent selfplay rounds.
+    tf_records = get_golden_chunk_records(window)
     state.iter_num += 1
     train(state, tf_records)
 
