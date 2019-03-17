@@ -37,6 +37,7 @@ import time
 
 from absl import app, flags
 from rl_loop import example_buffer, fsdb
+from collections import OrderedDict
 
 flags.DEFINE_integer('iterations', 100, 'Number of iterations of the RL loop.')
 

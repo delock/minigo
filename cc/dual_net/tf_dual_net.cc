@@ -57,6 +57,9 @@ class TfDualNet : public DualNet {
    public:
     TfWorker(const GraphDef& graph_def) : batch_capacity_(0) {
       SessionOptions options;
+      options.config.set_intra_op_parallelism_threads(1);
+      options.config.set_inter_op_parallelism_threads(0);
+      options.config.set_use_per_session_threads(false);
       options.config.mutable_gpu_options()->set_allow_growth(true);
       session_.reset(NewSession(options));
       TF_CHECK_OK(session_->Create(graph_def));
