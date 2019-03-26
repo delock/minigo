@@ -38,7 +38,6 @@ import time
 from absl import app, flags
 from rl_loop import example_buffer, fsdb
 from tensorflow import gfile
-from collections import OrderedDict
 
 flags.DEFINE_integer('iterations', 100, 'Number of iterations of the RL loop.')
 
@@ -46,15 +45,15 @@ flags.DEFINE_float('gating_win_rate', 0.55,
                    'Win-rate against the current best required to promote a '
                    'model to new best.')
 
-flags.DEFINE_float('overwhelming_win_rate', 0.80,
+flags.DEFINE_float('overwhelming_win_rate', 1.01, #0.80,
                    'Decide whether a new model win over old model with high '
                    'win rate.')
 
-flags.DEFINE_float('low_win_rate', 0.20,
+flags.DEFINE_float('low_win_rate', -0.01, #0.20,
                    'Decide whether a new model win over old model with low '
                    'win rate.')
 
-flags.DEFINE_float('bias_threshold', 0.70,
+flags.DEFINE_float('bias_threshold', 1.01, #0.70,
                    'Decide whether a game result is high biased.')
 
 flags.DEFINE_string('flags_dir', None,
@@ -173,6 +172,45 @@ def parse_win_stats_table(stats_str, num_lines):
   return result
 
 
+def extract_multi_instance(cmd):
+  cmd_list = flags.FlagValues().read_flags_from_files(cmd)
+  new_cmd_list = []
+  multi_instance = False
+  num_instance = 0
+  num_games = 0
+  parallel_games = 0
+
+  for arg in cmd_list:
+    argsplit = arg.split('=', 1)
+    flag = argsplit[0]
+    if flag == '--multi_instance':
+      if argsplit[1] == 'True':
+        multi_instance = True
+      else:
+        multi_instance = False
+    elif flag == '--num_games':
+      num_games = int(argsplit[1])
+    elif flag == '--parallel_games':
+      parallel_games = int(argsplit[1])
+
+  if multi_instance:
+    if num_games % parallel_games != 0:
+      logging.error('Error num_games must be multiply of %d', parallel_games)
+      raise RuntimeError('incompatible num_games/parallel_games combination')
+    num_instance = num_games//parallel_games
+
+  for arg in cmd_list:
+    argsplit = arg.split('=', 1)
+    flag = argsplit[0]
+    if flag == '--multi_instance':
+      pass
+    elif multi_instance and flag == '--num_games':
+      pass
+    else:
+      new_cmd_list.append(arg)
+
+  return multi_instance, num_instance, new_cmd_list
+
 def expand_cmd_str(cmd):
   return '  '.join(flags.FlagValues().read_flags_from_files(cmd))
 
@@ -230,139 +268,85 @@ async def checked_run(*cmd):
     # Split stdout into lines.
     return stdout.split('\n')
 
-def expand_flags(cmd, *args):
-  """Expand & dedup any flagfile command line arguments."""
-
-  # Read any flagfile arguments and expand them into a new list.
-  expanded = flags.FlagValues().read_flags_from_files(args)
-
-  # When one flagfile includes & overrides a base one, the expanded list may
-  # contain multiple instances of the same flag with different values.
-  # Deduplicate, always taking the last occurance of the flag.
-  deduped = OrderedDict()
-  deduped_vals = OrderedDict()
-  for arg in expanded:
-    argsplit = arg.split('=', 1)
-    flag = argsplit[0]
-    if flag in deduped.keys():
-      # in the case of --lr_rate and --lr_boundaries, same key might appear
-      # multiple times, make sure they all appear in command arg list
-      deduped[flag] += " {}".format(arg)
-    else:
-      deduped[flag] = arg
-    if len(argsplit) > 1:
-      deduped_vals[flag] = argsplit[1]
-  num_instance = 1
-  if '--multi_instance' in deduped_vals.keys():
-    # for multi-instance mode, num_games and parallel_games will be used to
-    # demine how many subprocs needed to run all the games on multiple processes
-    # or multiple computer nodes
-    if deduped_vals["--multi_instance"] == "True":
-      num_games = int(deduped_vals["--num_games"])
-      parallel_games = int(deduped_vals["--parallel_games"])
-      if num_games % parallel_games != 0:
-        logging.error('Error num_games must be multiply of %d', parallel_games)
-        raise RuntimeError('incompatible num_games/parallel_games combination')
-      num_instance = num_games/parallel_games
-      del(deduped['--num_games'])
-    del(deduped['--multi_instance'])
-  cmds = [cmd]+list(deduped.values())
-  return cmds, num_instance
-
-def checked_run_mi(name, *cmd):
-  # Log the expanded & deduped list of command line arguments, so we can know
-  # exactly what's going on. Note that we don't pass the expanded list of
-  # arguments to the actual subprocess because of a quirk in how unknown flags
-  # are handled: unknown flags in flagfiles are silently ignored, while unknown
-  # flags on the command line will cause the subprocess to abort.
-  cmd, num_instance = expand_flags(*cmd)
-  logging.info('Running %s*%d:\n  %s', name, num_instance, '\n  '.join(cmd))
+def checked_run_mi(num_instance, *cmd):
+  name = get_cmd_name(cmd)
+  logging.info('Running %s*%d: %s', name, num_instance, expand_cmd_str(cmd))
   with utils.logged_timer('%s finished' % name.capitalize()):
-    # if num_instance == 0, use default behavior for GPU
-    if num_instance == 1:
-      try:
-        cmd = ' '.join(cmd)
-        completed_output = subprocess.check_output(
-          cmd, shell=True, stderr=subprocess.STDOUT)
-      except subprocess.CalledProcessError as err:
-        logging.error('Error running %s: %s', name, err.output.decode())
-        raise RuntimeError('Non-zero return code executing %s' % ' '.join(cmd))
-      logging.info(completed_output.decode())
-      return completed_output
-    else:
-      num_parallel_instance = int(multiprocessing.cpu_count())
-      procs=[None]*num_parallel_instance
-      results = [""]*num_parallel_instance
-      lines = [""]*num_parallel_instance
-      result=""
+    num_parallel_instance = int(multiprocessing.cpu_count())
+    procs=[None]*num_parallel_instance
+    results = [""]*num_parallel_instance
+    lines = [""]*num_parallel_instance
+    result_list = []
 
-      cur_instance = 0
-      # add new proc into procs
-      while cur_instance < num_instance or not all (
-          proc is None for proc in procs):
-        if None in procs and cur_instance < num_instance:
-          index = procs.index(None)
-          subproc_cmd = [
-                  'OMP_NUM_THREADS=1',
-                  'KMP_AFFINITY=granularity=fine,proclist=[{}],explicit'.format(
-                      ','.join(str(i) for i in list(range(
-                          index, index+1))))]
-          subproc_cmd = subproc_cmd + cmd
-          subproc_cmd = subproc_cmd + ['--instance_id={}'.format(cur_instance)]
-          subproc_cmd = ' '.join(subproc_cmd)
-          if (cur_instance == 0):
-            logging.info("subproc_cmd = {}".format(subproc_cmd))
-          procs[index] = subprocess.Popen(subproc_cmd, shell=True,
-                                          stdout=subprocess.PIPE,
-                                          stderr=subprocess.STDOUT)
+    cur_instance = 0
+    # add new proc into procs
+    while cur_instance < num_instance or not all (
+        proc is None for proc in procs):
+      if None in procs and cur_instance < num_instance:
+        index = procs.index(None)
+        subproc_cmd = [
+                'OMP_NUM_THREADS=1',
+                'KMP_AFFINITY=granularity=fine,proclist=[{}],explicit'.format(
+                    ','.join(str(i) for i in list(range(
+                        index, index+1)))),
+                *cmd,
+                '--instance_id={}'.format(cur_instance),
+        ]
+        subproc_cmd = ' '.join(subproc_cmd)
+        if (cur_instance == 0):
+          logging.info("subproc_cmd = {}".format(subproc_cmd))
+        procs[index] = subprocess.Popen(subproc_cmd, shell=True,
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT)
+
+        proc_count = 0
+        for i in range(num_parallel_instance):
+          if procs[i] != None:
+            proc_count += 1
+        logging.debug('started instance {} in proc {}. proc count = {}'.format(
+            cur_instance, index, proc_count))
+
+        # change stdout of the process to non-blocking
+        # this is for collect output in a single thread
+        flags = fcntl.fcntl(procs[index].stdout, fcntl.F_GETFL)
+        fcntl.fcntl(procs[index].stdout, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+        cur_instance += 1
+      for index in range(num_parallel_instance):
+        if procs[index] != None:
+          # collect proc output
+          while True:
+            try:
+              line = procs[index].stdout.readline()
+              if line == b'':
+                break
+              results[index] = results[index] + line.decode()
+            except IOError:
+              break
+
+          ret_val = procs[index].poll()
+          if ret_val == None:
+            continue
+          elif ret_val != 0:
+            logging.debug(results[index])
+            raise RuntimeError(
+              'Non-zero return code (%d) executing %s' % (
+                  ret_val, subproc_cmd))
+
+          if index == 0:
+            logging.debug(results[index])
+          result_list.append(results[index])
+          results[index] = ""
+          procs[index] = None
 
           proc_count = 0
           for i in range(num_parallel_instance):
             if procs[i] != None:
               proc_count += 1
-          logging.debug('started instance {} in proc {}. proc count = {}'.format(
-              cur_instance, index, proc_count))
-
-          # change stdout of the process to non-blocking
-          # this is for collect output in a single thread
-          flags = fcntl.fcntl(procs[index].stdout, fcntl.F_GETFL)
-          fcntl.fcntl(procs[index].stdout, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-
-          cur_instance += 1
-        for index in range(num_parallel_instance):
-          if procs[index] != None:
-            # collect proc output
-            while True:
-              try:
-                line = procs[index].stdout.readline()
-                if line == b'':
-                  break
-                results[index] = results[index] + line.decode()
-              except IOError:
-                break
-
-            ret_val = procs[index].poll()
-            if ret_val == None:
-              continue
-            elif ret_val != 0:
-              logging.debug(results[index])
-              raise RuntimeError(
-                'Non-zero return code (%d) executing %s' % (
-                    ret_val, subproc_cmd))
-
-            result += results[index]
-            results[index] = ""
-            procs[index] = None
-
-            proc_count = 0
-            for i in range(num_parallel_instance):
-              if procs[i] != None:
-                proc_count += 1
-            logging.debug('proc {} finished. proc count = {}'.format(
-                index, proc_count))
-        time.sleep(0.001)  # avoid busy loop
-      return result.encode('utf-8')
-
+          logging.debug('proc {} finished. proc count = {}'.format(
+              index, proc_count))
+      time.sleep(0.001)  # avoid busy loop
+    return result_list
 
 def get_lines(completed_output, slice):
   return '\n'.join(completed_output.decode()[:-1].split('\n')[slice])
@@ -424,22 +408,50 @@ async def selfplay(state, flagfile='selfplay'):
   holdout_dir = os.path.join(fsdb.holdout_dir(), state.output_model_name)
   #sgf_dir = os.path.join(fsdb.sgf_dir(), state.output_model_name)
 
-  lines = await checked_run(
-      'bazel-bin/cc/selfplay',
-      '--flagfile={}.flags'.format(os.path.join(FLAGS.flags_dir, flagfile)),
-      '--model={}'.format(state.best_model_path),
-      '--output_dir={}'.format(output_dir),
-      '--holdout_dir={}'.format(holdout_dir),
-      #'--sgf_dir={}'.format(sgf_dir),
-      '--sgf_timestamp=false',
-      '--seed={}'.format(state.seed))
-  result = '\n'.join(lines[-6:])
-  logging.info(result)
-  stats = parse_win_stats_table(result, 1)[0]
-  num_games = stats.total_wins
+  multi_instance, num_instance, flag_list = extract_multi_instance(
+      ['--flagfile={}_mi.flags'.format(os.path.join(FLAGS.flags_dir, flagfile))])
+  if not multi_instance:
+    lines = await checked_run(
+        'bazel-bin/cc/selfplay',
+        '--flagfile={}.flags'.format(os.path.join(FLAGS.flags_dir, flagfile)),
+        '--model={}'.format(state.best_model_path),
+        '--output_dir={}'.format(output_dir),
+        '--holdout_dir={}'.format(holdout_dir),
+        #'--sgf_dir={}'.format(sgf_dir),
+        #'--sgf_timestamp=false',
+        '--seed={}'.format(state.seed))
+    result = '\n'.join(lines[-6:])
+    stats = parse_win_stats_table(result, 1)[0]
+    logging.info(result)
+    num_games = stats.total_wins
+    black_total = stats.black_wins.total
+    white_total = stats.white_wins.total
+  else:
+    result_list = checked_run_mi(
+        num_instance,
+        'bazel-bin/cc/selfplay',
+        '--flagfile={}.flags'.format(os.path.join(FLAGS.flags_dir, flagfile)),
+        '--model={}'.format(state.best_model_path),
+        '--output_dir={}'.format(output_dir),
+        '--holdout_dir={}'.format(holdout_dir),
+        #'--sgf_dir={}'.format(sgf_dir),
+        #'--sgf_timestamp=false',
+        '--seed={}'.format(state.seed))
+    num_games = 0
+    black_total = 0
+    white_total = 0
+    for result in result_list:
+      stats = parse_win_stats_table(result, 1)[0]
+      num_games += stats.total_wins
+      black_total += stats.black_wins.total
+      white_total += stats.white_wins.total
+    logging.info(result_list[0])
   logging.info('Black won %0.3f, white won %0.3f',
-               stats.black_wins.total / num_games,
-               stats.white_wins.total / num_games)
+             black_total / num_games,
+             white_total / num_games)
+  bias = abs(white_total - black_total)/num_games
+  logging.info('Black total %d, white total %d, total games %d, bias %0.3f.',
+               black_total, white_total, num_games, bias)
 
   # Write examples to a single record.
   pattern = os.path.join(output_dir, '*', '*.zz')
@@ -458,23 +470,7 @@ async def selfplay(state, flagfile='selfplay'):
   buffer.parallel_fill(tf.gfile.Glob(pattern))
   buffer.flush(os.path.join(fsdb.golden_chunk_dir(),
                             state.output_model_name + '.tfrecord.zz'))
-  sgf_path = os.path.join(sgf_dir, "clean/*.sgf")
-  sgf_files = glob.glob(sgf_path)
-  full_sgf_path = os.path.join(sgf_dir, "full")
-  white_win = 0
-  black_win = 0
-  for file_name in sgf_files:
-    if 'W+' in open (file_name).read():
-        white_win += 1
-    if 'B+' in open (file_name).read():
-        black_win += 1
-  logging.info ("White win {} times, black win {} times.".format(white_win, black_win))
-  bias = abs(white_win - black_win)/(white_win+black_win)
-  logging.info ("selfplay bias = {}".format(bias))
-  # remove full_sgf_files to save space
-  with utils.logged_timer('remove sgf files'):
-    logging.info('removing {}'.format(full_sgf_path))
-    shutil.rmtree(full_sgf_path, ignore_errors=True)
+
   return bias
 
 
@@ -517,7 +513,7 @@ async def validate(state, holdout_glob):
       '--work_dir={}'.format(fsdb.working_dir()))
 
 
-async def evaluate_model(eval_model_path, target_model_path, sgf_dir, seed):
+async def evaluate_model(eval_model_path, target_model_path, sgf_dir, seed, flagfile='eval'):
   """Evaluate one model against a target.
 
   Args:
@@ -531,28 +527,56 @@ async def evaluate_model(eval_model_path, target_model_path, sgf_dir, seed):
   """
 
   # TODO(tommadams): Don't append .pb to model name for random model.
-  lines = await checked_run(
-      'bazel-bin/cc/eval',
-      '--flagfile={}'.format(os.path.join(FLAGS.flags_dir, 'eval.flags')),
-      '--model={}'.format(eval_model_path),
-      '--model_two={}'.format(target_model_path),
-      '--sgf_dir={}'.format(sgf_dir),
-      '--seed={}'.format(seed))
-  result = result.decode()
-  logging.info(result)
-  eval_stats, target_stats = parse_win_stats_table(result, 2)
-  num_games = eval_stats.total_wins + target_stats.total_wins
-  win_rate = eval_stats.total_wins / num_games
+  multi_instance, num_instance, flag_list = extract_multi_instance(
+      ['--flagfile={}_mi.flags'.format(os.path.join(FLAGS.flags_dir, flagfile))])
+  if not multi_instance:
+    lines = await checked_run(
+        'bazel-bin/cc/eval',
+        '--flagfile={}.flags'.format(os.path.join(FLAGS.flags_dir, flagfile)),
+        '--model={}'.format(eval_model_path),
+        '--model_two={}'.format(target_model_path),
+        '--sgf_dir={}'.format(sgf_dir),
+        '--seed={}'.format(seed))
+    result = '\n'.join(lines)
+    logging.info(result)
+    eval_stats, target_stats = parse_win_stats_table(result, 2)
+    num_games = eval_stats.total_wins + target_stats.total_wins
+    win_rate = eval_stats.total_wins / num_games
+    eval_total = eval_stats.total_wins
+    black_total = eval_stats.black_wins.total
+    white_total = eval_stats.white_wins.total
+  else:
+    result_list = checked_run_mi(
+        num_instance,
+        'bazel-bin/cc/eval',
+        '--flagfile={}.flags'.format(os.path.join(FLAGS.flags_dir, flagfile)),
+        '--model={}'.format(eval_model_path),
+        '--model_two={}'.format(target_model_path),
+        '--sgf_dir={}'.format(sgf_dir),
+        '--seed={}'.format(seed))
+    num_games = 0
+    black_total = 0
+    white_total = 0
+    eval_total = 0
+    for result in result_list:
+      eval_stats, target_stats = parse_win_stats_table(result, 2)
+      num_games += eval_stats.total_wins + target_stats.total_wins
+      eval_total += eval_stats.total_wins
+      black_total += eval_stats.black_wins.total
+      white_total += eval_stats.white_wins.total
+    win_rate = eval_total / num_games
+    logging.info(result_list[0])
+
+  if eval_total != 0:
+    bias = abs(white_total - black_total) / eval_total
+  else:
+    # by definition bias = 0.0 if eval model win zero games
+    bias = 0.0
   logging.info('Win rate %s vs %s: %.3f', eval_stats.model_name,
                target_stats.model_name, win_rate)
-  #pattern = '{}\s+(\d+)\s+\d+\.\d+%\s+(\d+)\s+\d+\.\d+%\s+(\d+)'.format(
-  #          eval_model)
-  #matches = re.findall(pattern, result)
-  #total = 0
-  #for i in range(len(matches)):
-  #  total += int(matches[i][0])
-  #win_rate = total * 0.01
-  #logging.info('Win rate %s vs %s: %.3f', eval_model, target_model, win_rate)
+  logging.info('Black total %d, white total %d, eval total %d, bias %0.3f.',
+               black_total, white_total, eval_total, bias)
+
   return win_rate
 
 
@@ -567,9 +591,15 @@ async def evaluate_trained_model(state):
       state.train_model_path, state.best_model_path,
       os.path.join(fsdb.eval_dir(), state.train_model_name), state.seed)
 
+async def evaluate_target_model(state):
+  sgf_dir = os.path.join(fsdb.eval_dir(), 'target')
+  target = 'tf,' + os.path.join(fsdb.models_dir(), 'target.pb')
+  return await evaluate_model(
+      state.train_model_path, target, sgf_dir, state.iter_num)
 
 def rl_loop():
   """The main reinforcement learning (RL) loop."""
+  print ('Gating win rate = {}'.format(FLAGS.gating_win_rate), flush=True)
 
   state = State()
 
@@ -608,6 +638,7 @@ def rl_loop():
       window = (FLAGS.slow_window_size +
                 (window - FLAGS.slow_window_size) // FLAGS.slow_window_speed)
     window = min(min(window, FLAGS.max_window_size), competitive_iter_count)
+    logging.info('Window size = %d', window)
 
     # Train on shuffled game data from recent selfplay rounds.
     tf_records = get_golden_chunk_records(window)
@@ -624,7 +655,11 @@ def rl_loop():
       # Run eval, validation & selfplay sequentially.
       model_win_rate = wait(evaluate_trained_model(state))
       wait(validate(state, holdout_glob))
-      #wait(selfplay(state))
+      wait(selfplay(state))
+
+    target_win_rate = wait(evaluate_target_model(state))
+    if target_win_rate >= 0.5:
+      break
 
     # TODO(tommadams): if a model doesn't get promoted after N iterations,
     # consider deleting the most recent N training checkpoints because training
@@ -633,27 +668,27 @@ def rl_loop():
       # Promote the trained model to the best model and increment the generation
       # number.
       # Tentatively promote current model and run a round of selfplay
-      temp_best_model_name = state.best_model_name
+      #temp_best_model_name = state.best_model_name
       state.best_model_name = state.train_model_name
       state.gen_num += 1
-      bias = wait(selfplay(state))
-      if bias > FLAGS.bias_threshold:
-        # Giveup promoting this model because new model is a biased model
-        state.best_model_name = temp_best_model_name
-        state.gen_num -= 1
-        # Regenerate selfplay data using previous model
-        tf_records = get_golden_chunk_records(1)
-        logging.info('Burying {} for selfplay bias > {}.'.format(tf_records[0],
-                     FLAGS.bias_threshold))
-        shutil.move(tf_records[0], tf_records[0] + '.bury')
-        bias = wait(selfplay(state))
-      elif model_win_rate >= FLAGS.overwhelming_win_rate:
-        # in the case that the promoted model win overwhelmingly over the old
-        # model, consider the old model non-competitive.  We re-do selfplay
-        # with the new best model and start training from new game plays
-        competitive_iter_count = 1
-    else:
-      bias = wait(selfplay(state))
+      #bias = wait(selfplay(state))
+      #if bias > FLAGS.bias_threshold:
+      #  # Giveup promoting this model because new model is a biased model
+      #  state.best_model_name = temp_best_model_name
+      #  state.gen_num -= 1
+      #  # Regenerate selfplay data using previous model
+      #  tf_records = get_golden_chunk_records(1)
+      #  logging.info('Burying {} for selfplay bias > {}.'.format(tf_records[0],
+      #               FLAGS.bias_threshold))
+      #  shutil.move(tf_records[0], tf_records[0] + '.bury')
+      #  bias = wait(selfplay(state))
+      #elif model_win_rate >= FLAGS.overwhelming_win_rate:
+      #  # in the case that the promoted model win overwhelmingly over the old
+      #  # model, consider the old model non-competitive.  We re-do selfplay
+      #  # with the new best model and start training from new game plays
+      #  competitive_iter_count = 1
+    #else:
+    #  bias = wait(selfplay(state))
     competitive_iter_count += 1
 
 
