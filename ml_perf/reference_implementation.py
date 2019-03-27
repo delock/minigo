@@ -62,7 +62,7 @@ flags.DEFINE_string('flags_dir', None,
                     'files: bootstrap.flags, selfplay.flags, eval.flags, '
                     'train.flags.')
 
-flags.DEFINE_string('check_point', True,
+flags.DEFINE_boolean('check_point', True,
                     'Whether to start from a checkpoint')
 
 flags.DEFINE_integer('max_window_size', 5,
@@ -637,7 +637,9 @@ def rl_loop():
     if not FLAGS.check_point:
       window = 1 + state.iter_num
     else:
-      window = FLAGS.max_window_size + state.iter_num + FLAGS.slow_window_speed + 2
+      window = (FLAGS.slow_window_size
+             + (FLAGS.max_window_size - FLAGS.slow_window_size) * FLAGS.slow_window_speed
+             + state.iter_num)
     if window >= FLAGS.slow_window_size:
       window = (FLAGS.slow_window_size +
                 (window - FLAGS.slow_window_size) // FLAGS.slow_window_speed)
@@ -651,14 +653,20 @@ def rl_loop():
 
     if FLAGS.parallel_post_train:
       # Run eval, validation & selfplay in parallel.
-      model_win_rate, _, _ = wait([
-          evaluate_trained_model(state),
-          validate(state, holdout_glob),
-          selfplay(state)])
+      if not FLAGS.check_point or state.iter_num > 1:
+        model_win_rate, _, _ = wait([
+            evaluate_trained_model(state),
+            validate(state, holdout_glob),
+            selfplay(state)])
+      else:
+        model_win_rate, _, _ = wait([
+            evaluate_trained_model(state),
+            selfplay(state)])
     else:
       # Run eval, validation & selfplay sequentially.
       model_win_rate = wait(evaluate_trained_model(state))
-      wait(validate(state, holdout_glob))
+      if not FLAGS.check_point or state.iter_num > 1:
+        wait(validate(state, holdout_glob))
       wait(selfplay(state))
 
     target_win_rate = wait(evaluate_target_model(state))
@@ -734,10 +742,6 @@ def main(unused_argv):
     shutil.copy('ml_perf/000000-000008.tfrecord.zz', fsdb.golden_chunk_dir())
     shutil.copy('ml_perf/000000-000009.tfrecord.zz', fsdb.golden_chunk_dir())
     shutil.copy('ml_perf/000000-000010.tfrecord.zz', fsdb.golden_chunk_dir())
-
-    # Copy the hold out data to the hold out directory.
-    shutil.copytree('ml_perf/000000-000000',
-                    os.path.join(fsdb.holdout_dir(),'000000-000000'))
 
   logging.getLogger().addHandler(
       logging.FileHandler(os.path.join(FLAGS.base_dir, 'rl_loop.log')))
