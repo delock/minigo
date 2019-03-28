@@ -1,6 +1,7 @@
 # rl_loop.flags: Flags for the reinforcement learning loop.
 
 --flags_dir=ml_perf/flags/9/
+--checkpoint_dir=ml_perf/checkpoint/
 
 --iterations=200
 --gating_win_rate=0.49
