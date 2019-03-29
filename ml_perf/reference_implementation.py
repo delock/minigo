@@ -34,6 +34,7 @@ import glob
 import threading
 import copy
 import time
+import glob
 
 from absl import app, flags
 from rl_loop import example_buffer, fsdb
@@ -62,8 +63,10 @@ flags.DEFINE_string('flags_dir', None,
                     'files: bootstrap.flags, selfplay.flags, eval.flags, '
                     'train.flags.')
 
-flags.DEFINE_boolean('check_point', True,
-                    'Whether to start from a checkpoint')
+flags.DEFINE_string('checkpoint_dir', None,
+                    'The checkpoint directory specify a start model and a set '
+                    'of golden chunks used to start training.  If not '
+                    'specified, will start from scratch.')
 
 flags.DEFINE_integer('max_window_size', 5,
                      'Maximum number of recent selfplay rounds to train on.')
@@ -595,13 +598,13 @@ async def evaluate_target_model(state):
   return await evaluate_model(
       state.train_model_path, target, sgf_dir, state.iter_num)
 
-def rl_loop():
+def rl_loop(golden_chunk_number):
   """The main reinforcement learning (RL) loop."""
   print ('Gating win rate = {}'.format(FLAGS.gating_win_rate), flush=True)
 
   state = State()
 
-  if not FLAGS.check_point:
+  if FLAGS.checkpoint_dir == None:
     # Play the first round of selfplay games with a fake model that returns
     # random noise. We do this instead of playing multiple games using a single
     # model bootstrapped with random noise to avoid any initial bias.
@@ -634,12 +637,16 @@ def rl_loop():
                                 '*')
 
     # Calculate the window size from which we'll select training chunks.
-    if not FLAGS.check_point:
+    if FLAGS.checkpoint_dir == None:
       window = 1 + state.iter_num
     else:
-      window = (FLAGS.slow_window_size
-             + (FLAGS.max_window_size - FLAGS.slow_window_size) * FLAGS.slow_window_speed
-             + state.iter_num)
+      # make first window size equal to golden chunk number in checkpoint_dir
+      if golden_chunk_number >= FLAGS.slow_window_size:
+        window = (FLAGS.slow_window_size
+               + (golden_chunk_number - FLAGS.slow_window_size) * FLAGS.slow_window_speed
+               + state.iter_num)
+      else:
+        window = golden_chunk_number + state.iter_num
     if window >= FLAGS.slow_window_size:
       window = (FLAGS.slow_window_size +
                 (window - FLAGS.slow_window_size) // FLAGS.slow_window_speed)
@@ -653,7 +660,7 @@ def rl_loop():
 
     if FLAGS.parallel_post_train:
       # Run eval, validation & selfplay in parallel.
-      if not FLAGS.check_point or state.iter_num > 1:
+      if FLAGS.checkpoint_dir == None or state.iter_num > 1:
         model_win_rate, _, _ = wait([
             evaluate_trained_model(state),
             validate(state, holdout_glob),
@@ -665,7 +672,7 @@ def rl_loop():
     else:
       # Run eval, validation & selfplay sequentially.
       model_win_rate = wait(evaluate_trained_model(state))
-      if not FLAGS.check_point or state.iter_num > 1:
+      if FLAGS.checkpoint_dir == None or state.iter_num > 1:
         wait(validate(state, holdout_glob))
       wait(selfplay(state))
 
@@ -726,22 +733,17 @@ def main(unused_argv):
   # Copy the target model to the models directory so we can find it easily.
   shutil.copy('ml_perf/target.pb', fsdb.models_dir())
 
-  if FLAGS.check_point:
+  golden_chunk_number = 0
+  if FLAGS.checkpoint_dir:
     # Copy the start model to the models directory.
-    shutil.copy('ml_perf/start.pb', fsdb.models_dir())
+    start_model_path = os.path.join(FLAGS.checkpoint_dir, 'start.pb')
+    shutil.copy(start_model_path, fsdb.models_dir())
 
     # Copy the golden chunks to the golden chunks directory.
-    shutil.copy('ml_perf/000000-000000.tfrecord.zz', fsdb.golden_chunk_dir())
-    shutil.copy('ml_perf/000000-000001.tfrecord.zz', fsdb.golden_chunk_dir())
-    shutil.copy('ml_perf/000000-000002.tfrecord.zz', fsdb.golden_chunk_dir())
-    shutil.copy('ml_perf/000000-000003.tfrecord.zz', fsdb.golden_chunk_dir())
-    shutil.copy('ml_perf/000000-000004.tfrecord.zz', fsdb.golden_chunk_dir())
-    shutil.copy('ml_perf/000000-000005.tfrecord.zz', fsdb.golden_chunk_dir())
-    shutil.copy('ml_perf/000000-000006.tfrecord.zz', fsdb.golden_chunk_dir())
-    shutil.copy('ml_perf/000000-000007.tfrecord.zz', fsdb.golden_chunk_dir())
-    shutil.copy('ml_perf/000000-000008.tfrecord.zz', fsdb.golden_chunk_dir())
-    shutil.copy('ml_perf/000000-000009.tfrecord.zz', fsdb.golden_chunk_dir())
-    shutil.copy('ml_perf/000000-000010.tfrecord.zz', fsdb.golden_chunk_dir())
+    golden_chunk_path = os.path.join(FLAGS.checkpoint_dir, '*.tfrecord.zz')
+    for f in glob.glob(golden_chunk_path):
+      shutil.copy(f, fsdb.golden_chunk_dir())
+      golden_chunk_number += 1
 
   logging.getLogger().addHandler(
       logging.FileHandler(os.path.join(FLAGS.base_dir, 'rl_loop.log')))
@@ -752,7 +754,7 @@ def main(unused_argv):
 
   with utils.logged_timer('Total time'):
     try:
-      rl_loop()
+      rl_loop(golden_chunk_number)
     finally:
       asyncio.get_event_loop().close()
 
