@@ -68,7 +68,6 @@ DEFINE_string(model, "",
               "engine=lite, the model should be .tflite flatbuffer.");
 DEFINE_string(model_two, "", "Descriptor for the second model");
 DEFINE_int32(parallel_games, 32, "Number of games to play in parallel.");
-DEFINE_int32(instance_id, 0, "Unique id with multi-instance.");
 
 // Output flags.
 DEFINE_string(output_bigtable, "",
@@ -99,13 +98,18 @@ class Evaluator {
   class Model {
    public:
     Model(BatchingDualNetFactory* batcher, const std::string& path)
-        : batcher_(batcher),
-          path_(path),
-          name_(batcher->NewDualNet(path)->name()) {}
+        : batcher_(batcher), path_(path) {}
 
     BatchingDualNetFactory* batcher() { return batcher_; }
-    const std::string& name() const { return name_; }
-    const std::string& path() const { return path_; }
+    std::string name() {
+      absl::MutexLock lock(&mutex_);
+      if (name_.empty()) {
+        // The model's name is lazily initialized the first time we create a
+        // instance. Make sure it's valid.
+        NewDualNetImpl();
+      }
+      return name_;
+    }
 
     WinStats GetWinStats() const {
       absl::MutexLock lock(&mutex_);
@@ -117,11 +121,24 @@ class Evaluator {
       win_stats_.Update(game);
     }
 
+    std::unique_ptr<DualNet> NewDualNet() {
+      absl::MutexLock lock(&mutex_);
+      return NewDualNetImpl();
+    }
+
    private:
+    std::unique_ptr<DualNet> NewDualNetImpl() EXCLUSIVE_LOCKS_REQUIRED(&mutex_) {
+      auto dual_net = batcher_->NewDualNet(path_);
+      if (name_.empty()) {
+        name_ = dual_net->name();
+      }
+      return dual_net;
+    }
+
     mutable absl::Mutex mutex_;
-    BatchingDualNetFactory* batcher_;
+    BatchingDualNetFactory* batcher_ GUARDED_BY(&mutex_);
     const std::string path_;
-    const std::string name_;
+    std::string name_ GUARDED_BY(&mutex_);
     WinStats win_stats_ GUARDED_BY(&mutex_);
   };
 
@@ -153,10 +170,7 @@ class Evaluator {
     ParseOptionsFromFlags(&game_options_, &player_options_);
 
     int num_games = FLAGS_parallel_games;
-    int instance_id = FLAGS_instance_id;
-    int thread_id_begin = instance_id*num_games;
-    for (int thread_id = thread_id_begin;
-             thread_id < thread_id_begin+num_games; ++thread_id) {
+    for (int thread_id = 0; thread_id < num_games; ++thread_id) {
       bool swap_models = (thread_id & 1) != 0;
       threads_.emplace_back(std::bind(&Evaluator::ThreadRun, this, thread_id,
                                       swap_models ? &model_b : &model_a,
@@ -204,13 +218,11 @@ class Evaluator {
     const bool verbose = thread_id == 0;
     player_options.verbose = false;
     auto black = absl::make_unique<MctsPlayer>(
-        black_model->batcher()->NewDualNet(black_model->path()), nullptr, &game,
-        player_options);
+        black_model->NewDualNet(), nullptr, &game, player_options);
 
     player_options.verbose = false;
     auto white = absl::make_unique<MctsPlayer>(
-        white_model->batcher()->NewDualNet(white_model->path()), nullptr, &game,
-        player_options);
+        white_model->NewDualNet(), nullptr, &game, player_options);
 
     BatchingDualNetFactory::StartGame(black->network(), white->network());
     auto* curr_player = black.get();

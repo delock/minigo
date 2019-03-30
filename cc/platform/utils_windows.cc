@@ -14,9 +14,6 @@
 
 #include "cc/platform/utils.h"
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-
 #include <cstring>
 
 namespace minigo {
@@ -29,12 +26,14 @@ int GetNumLogicalCpus() {
   return sysinfo.dwNumberOfProcessors;
 }
 
+ProcessId GetProcessId() { return ::GetCurrentProcessId(); }
+
 std::string GetHostname() {
+  // Windows guarantees that a 256B buffer is large enough to hold the hostname,
+  // so we don't need to worry about whether a truncated hostname is
+  // null-terminated.
   char hostname[256];
-  if (gethostname(hostname, sizeof(hostname)) != 0) {
-    std::strncpy(hostname, "unknown", sizeof(hostname));
-  }
-  return std::string(hostname);
+  return gethostname(hostname, sizeof(hostname)) == 0 ? hostname : "hostname";
 }
 
 }  // namespace minigo

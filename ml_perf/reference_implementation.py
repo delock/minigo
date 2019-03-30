@@ -295,8 +295,7 @@ def checked_run_mi(num_instance, *cmd):
                 'KMP_AFFINITY=granularity=fine,proclist=[{}],explicit'.format(
                     ','.join(str(i) for i in list(range(
                         index, index+1)))),
-                *cmd,
-                '--instance_id={}'.format(cur_instance),
+                *cmd
         ]
         subproc_cmd = ' '.join(subproc_cmd)
         if (cur_instance == 0):

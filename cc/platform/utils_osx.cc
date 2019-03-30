@@ -15,14 +15,11 @@
 #include "cc/platform/utils.h"
 
 #include <sys/sysctl.h>
-#include <unistd.h>
 #include <cstring>
 
 #include "cc/logging.h"
 
 namespace minigo {
-
-bool FdSupportsAnsiColors(int fd) { return isatty(fd); }
 
 int GetNumLogicalCpus() {
   int nproc = 0;
@@ -32,12 +29,16 @@ int GetNumLogicalCpus() {
   return nproc;
 }
 
+bool FdSupportsAnsiColors(int fd) { return isatty(fd); }
+
+ProcessId GetProcessId() { return getpid(); }
+
 std::string GetHostname() {
+  // Posix guarantees that a 256B buffer is large enough to hold the hostname,
+  // so we don't need to worry about whether a truncated hostname is
+  // null-terminated.
   char hostname[256];
-  if (gethostname(hostname, sizeof(hostname)) != 0) {
-    std::strncpy(hostname, "unknown", sizeof(hostname));
-  }
-  return std::string(hostname);
+  return gethostname(hostname, sizeof(hostname)) == 0 ? hostname : "hostname";
 }
 
 }  // namespace minigo
