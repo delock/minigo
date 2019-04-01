@@ -18,6 +18,7 @@ import sys
 sys.path.insert(0, '.')  # nopep8
 
 import asyncio
+import glob
 import logging
 import numpy as np
 import os
@@ -27,18 +28,21 @@ import shutil
 import subprocess
 import tensorflow as tf
 import time
-import utils
-import multiprocessing
-import fcntl
-import glob
-import threading
-import copy
-import time
-import glob
+from ml_perf.utils import *
 
 from absl import app, flags
 from rl_loop import example_buffer, fsdb
 from tensorflow import gfile
+
+N = int(os.environ.get('BOARD_SIZE', 19))
+
+flags.DEFINE_string('checkpoint_dir', 'ml_perf/checkpoint/{}'.format(N),
+                    'The checkpoint directory specify a start model and a set '
+                    'of golden chunks used to start training.  If not '
+                    'specified, will start from scratch.')
+
+flags.DEFINE_string('target_path', 'ml_perf/target/{}/target.pb'.format(N),
+                    'Path to the target model to beat.')
 
 flags.DEFINE_integer('iterations', 100, 'Number of iterations of the RL loop.')
 
@@ -46,38 +50,14 @@ flags.DEFINE_float('gating_win_rate', 0.55,
                    'Win-rate against the current best required to promote a '
                    'model to new best.')
 
-flags.DEFINE_float('overwhelming_win_rate', 1.01, #0.80,
-                   'Decide whether a new model win over old model with high '
-                   'win rate.')
-
-flags.DEFINE_float('low_win_rate', -0.01, #0.20,
-                   'Decide whether a new model win over old model with low '
-                   'win rate.')
-
-flags.DEFINE_float('bias_threshold', 1.01, #0.70,
-                   'Decide whether a game result is high biased.')
-
 flags.DEFINE_string('flags_dir', None,
                     'Directory in which to find the flag files for each stage '
                     'of the RL loop. The directory must contain the following '
                     'files: bootstrap.flags, selfplay.flags, eval.flags, '
                     'train.flags.')
 
-flags.DEFINE_string('checkpoint_dir', None,
-                    'The checkpoint directory specify a start model and a set '
-                    'of golden chunks used to start training.  If not '
-                    'specified, will start from scratch.')
-
-flags.DEFINE_integer('max_window_size', 5,
+flags.DEFINE_integer('window_size', 10,
                      'Maximum number of recent selfplay rounds to train on.')
-
-flags.DEFINE_integer('slow_window_size', 5,
-                     'Window size after which the window starts growing by '
-                     '1 every slow_window_speed iterations of the RL loop.')
-
-flags.DEFINE_integer('slow_window_speed', 1,
-                     'Speed at which the training window increases in size '
-                     'once the window size passes slow_window_size.')
 
 flags.DEFINE_boolean('parallel_post_train', False,
                      'If true, run the post-training stages (eval, validation '
@@ -153,12 +133,42 @@ class WinStats:
     pattern = '\s*(\S+)' + '\s+(\d+)' * 8
     match = re.search(pattern, line)
     if match is None:
-        raise ValueError('Can\t parse line "{}"'.format(line))
+      raise ValueError('Can\t parse line "{}"'.format(line))
     self.model_name = match.group(1)
     raw_stats = [float(x) for x in match.groups()[1:]]
     self.black_wins = ColorWinStats(*raw_stats[:4])
     self.white_wins = ColorWinStats(*raw_stats[4:])
     self.total_wins = self.black_wins.total + self.white_wins.total
+
+
+def initialize_from_checkpoint(state):
+  """Initialize the reinforcement learning loop from a checkpoint."""
+
+  # The checkpoint's work_dir should contain the most recently trained model.
+  model_paths = glob.glob(os.path.join(FLAGS.checkpoint_dir,
+                                       'work_dir/model.ckpt-*.pb'))
+  if len(model_paths) != 1:
+    raise RuntimeError('Expected exactly one model in the checkpoint work_dir, '
+                       'got [{}]'.format(', '.join(model_paths)))
+  start_model_path = model_paths[0]
+
+  # Copy the latest trained model into the models directory and use it on the
+  # first round of selfplay.
+  state.best_model_name = 'checkpoint'
+  shutil.copy(start_model_path,
+              os.path.join(fsdb.models_dir(), state.best_model_name + '.pb'))
+
+  # Copy the training chunks.
+  golden_chunks_dir = os.path.join(FLAGS.checkpoint_dir, 'golden_chunks')
+  for basename in os.listdir(golden_chunks_dir):
+    path = os.path.join(golden_chunks_dir, basename)
+    shutil.copy(path, fsdb.golden_chunk_dir())
+
+  # Copy the training files.
+  work_dir = os.path.join(FLAGS.checkpoint_dir, 'work_dir')
+  for basename in os.listdir(work_dir):
+    path = os.path.join(work_dir, basename)
+    shutil.copy(path, fsdb.working_dir())
 
 
 def parse_win_stats_table(stats_str, num_lines):
@@ -217,19 +227,7 @@ def extract_multi_instance(cmd):
 
   return multi_instance, num_instance, new_cmd_list
 
-def expand_cmd_str(cmd):
-  return '  '.join(flags.FlagValues().read_flags_from_files(cmd))
-
-
-def get_cmd_name(cmd):
-  if cmd[0] == 'python' or cmd[0] == 'python3':
-    path = cmd[1]
-  else:
-    path = cmd[0]
-  return os.path.splitext(os.path.basename(path))[0]
-
-
-async def checked_run(*cmd):
+async def run(*cmd):
   """Run the given subprocess command in a coroutine.
 
   Args:
@@ -243,160 +241,56 @@ async def checked_run(*cmd):
     RuntimeError: if the command returns a non-zero result.
   """
 
-  # Start the subprocess.
-  logging.info('Running: %s', expand_cmd_str(cmd))
-  with utils.logged_timer('{} finished'.format(get_cmd_name(cmd))):
-    p = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+  stdout = await checked_run(*cmd)
 
-    # Stream output from the process stdout.
-    chunks = []
-    while True:
-      chunk = await p.stdout.read(16 * 1024)
-      if not chunk:
-        break
-      chunks.append(chunk)
+  log_path = os.path.join(FLAGS.base_dir, get_cmd_name(cmd) + '.log')
+  with gfile.Open(log_path, 'a') as f:
+    f.write(expand_cmd_str(cmd))
+    f.write('\n')
+    f.write(stdout)
+    f.write('\n')
 
-    # Wait for the process to finish, check it was successful & build stdout.
-    await p.wait()
-    stdout = b''.join(chunks).decode()[:-1]
-    if p.returncode:
-      raise RuntimeError('Return code {} from process: {}\n{}'.format(
-          p.returncode, expand_cmd_str(cmd), stdout))
+  # Split stdout into lines.
+  return stdout.split('\n')
 
-    log_path = os.path.join(FLAGS.base_dir, get_cmd_name(cmd) + '.log')
-    with gfile.Open(log_path, 'a') as f:
-      f.write(expand_cmd_str(cmd))
-      f.write('\n')
-      f.write(stdout)
-      f.write('\n')
 
-    # Split stdout into lines.
-    return stdout.split('\n')
-
-def checked_run_mi(num_instance, *cmd):
-  name = get_cmd_name(cmd)
-  logging.info('Running %s*%d: %s', name, num_instance, expand_cmd_str(cmd))
-  with utils.logged_timer('%s finished' % name.capitalize()):
-    num_parallel_instance = int(multiprocessing.cpu_count())
-    procs=[None]*num_parallel_instance
-    results = [""]*num_parallel_instance
-    lines = [""]*num_parallel_instance
-    result_list = []
-
-    cur_instance = 0
-    # add new proc into procs
-    while cur_instance < num_instance or not all (
-        proc is None for proc in procs):
-      if None in procs and cur_instance < num_instance:
-        index = procs.index(None)
-        subproc_cmd = [
-                'OMP_NUM_THREADS=1',
-                'KMP_AFFINITY=granularity=fine,proclist=[{}],explicit'.format(
-                    ','.join(str(i) for i in list(range(
-                        index, index+1)))),
-                *cmd
-        ]
-        subproc_cmd = ' '.join(subproc_cmd)
-        if (cur_instance == 0):
-          logging.info("subproc_cmd = {}".format(subproc_cmd))
-        procs[index] = subprocess.Popen(subproc_cmd, shell=True,
-                                        stdout=subprocess.PIPE,
-                                        stderr=subprocess.STDOUT)
-
-        proc_count = 0
-        for i in range(num_parallel_instance):
-          if procs[i] != None:
-            proc_count += 1
-        logging.debug('started instance {} in proc {}. proc count = {}'.format(
-            cur_instance, index, proc_count))
-
-        # change stdout of the process to non-blocking
-        # this is for collect output in a single thread
-        flags = fcntl.fcntl(procs[index].stdout, fcntl.F_GETFL)
-        fcntl.fcntl(procs[index].stdout, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-
-        cur_instance += 1
-      for index in range(num_parallel_instance):
-        if procs[index] != None:
-          # collect proc output
-          while True:
-            try:
-              line = procs[index].stdout.readline()
-              if line == b'':
-                break
-              results[index] = results[index] + line.decode()
-            except IOError:
-              break
-
-          ret_val = procs[index].poll()
-          if ret_val == None:
-            continue
-          elif ret_val != 0:
-            logging.debug(results[index])
-            raise RuntimeError(
-              'Non-zero return code (%d) executing %s' % (
-                  ret_val, subproc_cmd))
-
-          if index == 0:
-            logging.debug(results[index])
-          result_list.append(results[index])
-          results[index] = ""
-          procs[index] = None
-
-          proc_count = 0
-          for i in range(num_parallel_instance):
-            if procs[i] != None:
-              proc_count += 1
-          logging.debug('proc {} finished. proc count = {}'.format(
-              index, proc_count))
-      time.sleep(0.001)  # avoid busy loop
-    return result_list
-
-def get_lines(completed_output, slice):
-  return '\n'.join(completed_output.decode()[:-1].split('\n')[slice])
-
-def wait(aws):
-  """Waits for all of the awaitable objects (e.g. coroutines) in aws to finish.
-
-  All the awaitable objects are waited for, even if one of them raises an
-  exception. When one or more awaitable raises an exception, the exception from
-  the awaitable with the lowest index in the aws list will be reraised.
+def run_mi(num_instance, *cmd):
+  """Run the given subprocess command in multi-instance mode
 
   Args:
-    aws: a single awaitable, or list awaitables.
+    *cmd: the command to run and its arguments.
 
   Returns:
-    If aws is a single awaitable, its result.
-    If aws is a list of awaitables, a list containing the of each awaitable in
-    the list.
+    The output that the command wrote to stdout as a list of strings, one line
+    per element (stderr output is piped to stdout).
 
   Raises:
-    Exception: if any of the awaitables raises.
+    RuntimeError: if the command returns a non-zero result.
   """
 
-  aws_list = aws if isinstance(aws, list) else [aws]
-  results = asyncio.get_event_loop().run_until_complete(asyncio.gather(
-      *aws_list, return_exceptions=True))
-  # If any of the cmds failed, re-raise the error.
-  for result in results:
-    if isinstance(result, Exception):
-      raise result
-  return results if isinstance(aws, list) else results[0]
+  stdouts = checked_run_mi(num_instance, *cmd)
+
+  log_path = os.path.join(FLAGS.base_dir, get_cmd_name(cmd) + '.log')
+  with gfile.Open(log_path, 'a') as f:
+    f.write(expand_cmd_str(cmd))
+    f.write('\n')
+    for stdout in stdouts:
+      f.write(stdout)
+    f.write('\n')
+
+  # Split stdout into lines.
+  return stdouts
 
 
-def get_golden_chunk_records(num_records):
+def get_golden_chunk_records():
   """Return up to num_records of golden chunks to train on.
-
-  Args:
-    num_records: maximum number of records to return.
 
   Returns:
     A list of golden chunks up to num_records in length, sorted by path.
   """
 
   pattern = os.path.join(fsdb.golden_chunk_dir(), '*.zz')
-  return sorted(tf.gfile.Glob(pattern), reverse=True)[:num_records]
+  return sorted(tf.gfile.Glob(pattern), reverse=True)[:FLAGS.window_size]
 
 
 # Self-play a number of games.
@@ -415,7 +309,7 @@ async def selfplay(state, flagfile='selfplay'):
   multi_instance, num_instance, flag_list = extract_multi_instance(
       ['--flagfile={}_mi.flags'.format(os.path.join(FLAGS.flags_dir, flagfile))])
   if not multi_instance:
-    lines = await checked_run(
+    lines = await run(
         'bazel-bin/cc/selfplay',
         '--flagfile={}.flags'.format(os.path.join(FLAGS.flags_dir, flagfile)),
         '--model={}'.format(state.best_model_path),
@@ -429,7 +323,7 @@ async def selfplay(state, flagfile='selfplay'):
     black_total = stats.black_wins.total
     white_total = stats.white_wins.total
   else:
-    result_list = checked_run_mi(
+    result_list = run_mi(
         num_instance,
         'bazel-bin/cc/selfplay',
         '--flagfile={}.flags'.format(os.path.join(FLAGS.flags_dir, flagfile)),
@@ -507,10 +401,14 @@ async def validate(state, holdout_glob):
     holdout_glob: a glob that matches holdout games.
   """
 
-  await checked_run(
-      'python3', 'validate.py', holdout_glob,
-      '--flagfile={}'.format(os.path.join(FLAGS.flags_dir, 'validate.flags')),
-      '--work_dir={}'.format(fsdb.working_dir()))
+  if not glob.glob(holdout_glob):
+    print('Glob "{}" didn\'t match any files, skipping validation'.format(
+          holdout_glob))
+  else:
+    await run(
+        'python3', 'validate.py', holdout_glob,
+        '--flagfile={}'.format(os.path.join(FLAGS.flags_dir, 'validate.flags')),
+        '--work_dir={}'.format(fsdb.working_dir()))
 
 
 async def evaluate_model(eval_model_path, target_model_path, sgf_dir, seed, flagfile='eval'):
@@ -526,11 +424,10 @@ async def evaluate_model(eval_model_path, target_model_path, sgf_dir, seed, flag
     The win-rate of eval_model against target_model in the range [0, 1].
   """
 
-  # TODO(tommadams): Don't append .pb to model name for random model.
   multi_instance, num_instance, flag_list = extract_multi_instance(
       ['--flagfile={}_mi.flags'.format(os.path.join(FLAGS.flags_dir, flagfile))])
   if not multi_instance:
-    lines = await checked_run(
+    lines = await run(
         'bazel-bin/cc/eval',
         '--flagfile={}.flags'.format(os.path.join(FLAGS.flags_dir, flagfile)),
         '--model={}'.format(eval_model_path),
@@ -546,7 +443,7 @@ async def evaluate_model(eval_model_path, target_model_path, sgf_dir, seed, flag
     black_total = eval_stats.black_wins.total
     white_total = eval_stats.white_wins.total
   else:
-    result_list = checked_run_mi(
+    result_list = run_mi(
         num_instance,
         'bazel-bin/cc/eval',
         '--flagfile={}.flags'.format(os.path.join(FLAGS.flags_dir, flagfile)),
@@ -591,26 +488,30 @@ async def evaluate_trained_model(state):
       state.train_model_path, state.best_model_path,
       os.path.join(fsdb.eval_dir(), state.train_model_name), state.seed)
 
+
 async def evaluate_target_model(state):
   sgf_dir = os.path.join(fsdb.eval_dir(), 'target')
   target = 'tf,' + os.path.join(fsdb.models_dir(), 'target.pb')
   return await evaluate_model(
       state.train_model_path, target, sgf_dir, state.iter_num)
 
-def rl_loop(golden_chunk_number):
+
+def rl_loop():
   """The main reinforcement learning (RL) loop."""
-  print ('Gating win rate = {}'.format(FLAGS.gating_win_rate), flush=True)
 
   state = State()
 
-  if FLAGS.checkpoint_dir == None:
+  if FLAGS.checkpoint_dir:
+    # Start from a partially trained model.
+    initialize_from_checkpoint(state)
+  else:
     # Play the first round of selfplay games with a fake model that returns
     # random noise. We do this instead of playing multiple games using a single
     # model bootstrapped with random noise to avoid any initial bias.
     wait(selfplay(state, 'bootstrap'))
 
     # Train a real model from the random selfplay games.
-    tf_records = get_golden_chunk_records(1)
+    tf_records = get_golden_chunk_records()
     state.iter_num += 1
     wait(train(state, tf_records))
 
@@ -620,13 +521,6 @@ def rl_loop(golden_chunk_number):
 
     # Run selfplay using the new model.
     wait(selfplay(state))
-  else:
-    # Rounds we considered generated by a competitive player
-    # If a set of game is played by a non-competitive player, these games
-    # won't be used to train a strong model
-    state.best_model_name = 'start'
-
-  competitive_iter_count = FLAGS.max_window_size
 
   # Now start the full training loop.
   while state.iter_num <= FLAGS.iterations:
@@ -635,79 +529,32 @@ def rl_loop(golden_chunk_number):
     holdout_glob = os.path.join(fsdb.holdout_dir(), '%06d-*' % state.iter_num,
                                 '*')
 
-    # Calculate the window size from which we'll select training chunks.
-    if FLAGS.checkpoint_dir == None:
-      window = 1 + state.iter_num
-    else:
-      # make first window size equal to golden chunk number in checkpoint_dir
-      if golden_chunk_number >= FLAGS.slow_window_size:
-        window = (FLAGS.slow_window_size
-               + (golden_chunk_number - FLAGS.slow_window_size) * FLAGS.slow_window_speed
-               + state.iter_num)
-      else:
-        window = golden_chunk_number + state.iter_num
-    if window >= FLAGS.slow_window_size:
-      window = (FLAGS.slow_window_size +
-                (window - FLAGS.slow_window_size) // FLAGS.slow_window_speed)
-    window = min(min(window, FLAGS.max_window_size), competitive_iter_count)
-    logging.info('Window size = %d', window)
-
     # Train on shuffled game data from recent selfplay rounds.
-    tf_records = get_golden_chunk_records(window)
+    tf_records = get_golden_chunk_records()
     state.iter_num += 1
     wait(train(state, tf_records))
 
     if FLAGS.parallel_post_train:
       # Run eval, validation & selfplay in parallel.
-      if FLAGS.checkpoint_dir == None or state.iter_num > 1:
-        model_win_rate, _, _ = wait([
-            evaluate_trained_model(state),
-            validate(state, holdout_glob),
-            selfplay(state)])
-      else:
-        model_win_rate, _, _ = wait([
-            evaluate_trained_model(state),
-            selfplay(state)])
+      model_win_rate, _, _ = wait([
+          evaluate_trained_model(state),
+          validate(state, holdout_glob),
+          selfplay(state)])
     else:
       # Run eval, validation & selfplay sequentially.
       model_win_rate = wait(evaluate_trained_model(state))
-      if FLAGS.checkpoint_dir == None or state.iter_num > 1:
-        wait(validate(state, holdout_glob))
+      wait(validate(state, holdout_glob))
       wait(selfplay(state))
 
     target_win_rate = wait(evaluate_target_model(state))
     if target_win_rate >= 0.5:
       break
 
-    # TODO(tommadams): if a model doesn't get promoted after N iterations,
-    # consider deleting the most recent N training checkpoints because training
-    # might have got stuck in a local minima.
     if model_win_rate >= FLAGS.gating_win_rate:
       # Promote the trained model to the best model and increment the generation
       # number.
-      # Tentatively promote current model and run a round of selfplay
-      #temp_best_model_name = state.best_model_name
       state.best_model_name = state.train_model_name
       state.gen_num += 1
-      #bias = wait(selfplay(state))
-      #if bias > FLAGS.bias_threshold:
-      #  # Giveup promoting this model because new model is a biased model
-      #  state.best_model_name = temp_best_model_name
-      #  state.gen_num -= 1
-      #  # Regenerate selfplay data using previous model
-      #  tf_records = get_golden_chunk_records(1)
-      #  logging.info('Burying {} for selfplay bias > {}.'.format(tf_records[0],
-      #               FLAGS.bias_threshold))
-      #  shutil.move(tf_records[0], tf_records[0] + '.bury')
-      #  bias = wait(selfplay(state))
-      #elif model_win_rate >= FLAGS.overwhelming_win_rate:
-      #  # in the case that the promoted model win overwhelmingly over the old
-      #  # model, consider the old model non-competitive.  We re-do selfplay
-      #  # with the new best model and start training from new game plays
-      #  competitive_iter_count = 1
-    #else:
-    #  bias = wait(selfplay(state))
-    competitive_iter_count += 1
 
 
 def main(unused_argv):
@@ -715,13 +562,10 @@ def main(unused_argv):
 
   print('Wiping dir %s' % FLAGS.base_dir, flush=True)
   shutil.rmtree(FLAGS.base_dir, ignore_errors=True)
-
-  utils.ensure_dir_exists(fsdb.models_dir())
-  utils.ensure_dir_exists(fsdb.selfplay_dir())
-  utils.ensure_dir_exists(fsdb.holdout_dir())
-  utils.ensure_dir_exists(fsdb.eval_dir())
-  utils.ensure_dir_exists(fsdb.golden_chunk_dir())
-  utils.ensure_dir_exists(fsdb.working_dir())
+  dirs = [fsdb.models_dir(), fsdb.selfplay_dir(), fsdb.holdout_dir(),
+          fsdb.eval_dir(), fsdb.golden_chunk_dir(), fsdb.working_dir()]
+  for d in dirs:
+    ensure_dir_exists(d);
 
   # Copy the flag files so there's no chance of them getting accidentally
   # overwritten while the RL loop is running.
@@ -730,19 +574,7 @@ def main(unused_argv):
   FLAGS.flags_dir = flags_dir
 
   # Copy the target model to the models directory so we can find it easily.
-  shutil.copy('ml_perf/target.pb', fsdb.models_dir())
-
-  golden_chunk_number = 0
-  if FLAGS.checkpoint_dir:
-    # Copy the start model to the models directory.
-    start_model_path = os.path.join(FLAGS.checkpoint_dir, 'start.pb')
-    shutil.copy(start_model_path, fsdb.models_dir())
-
-    # Copy the golden chunks to the golden chunks directory.
-    golden_chunk_path = os.path.join(FLAGS.checkpoint_dir, '*.tfrecord.zz')
-    for f in glob.glob(golden_chunk_path):
-      shutil.copy(f, fsdb.golden_chunk_dir())
-      golden_chunk_number += 1
+  shutil.copy(FLAGS.target_path, os.path.join(fsdb.models_dir(), 'target.pb'))
 
   logging.getLogger().addHandler(
       logging.FileHandler(os.path.join(FLAGS.base_dir, 'rl_loop.log')))
@@ -751,9 +583,9 @@ def main(unused_argv):
   for handler in logging.getLogger().handlers:
     handler.setFormatter(formatter)
 
-  with utils.logged_timer('Total time'):
+  with logged_timer('Total time'):
     try:
-      rl_loop(golden_chunk_number)
+      rl_loop()
     finally:
       asyncio.get_event_loop().close()
 

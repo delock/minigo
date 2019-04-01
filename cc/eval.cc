@@ -68,6 +68,7 @@ DEFINE_string(model, "",
               "engine=lite, the model should be .tflite flatbuffer.");
 DEFINE_string(model_two, "", "Descriptor for the second model");
 DEFINE_int32(parallel_games, 32, "Number of games to play in parallel.");
+DEFINE_int32(instance_id, 0, "Unique id with multi-instance.");
 
 // Output flags.
 DEFINE_string(output_bigtable, "",
@@ -170,7 +171,10 @@ class Evaluator {
     ParseOptionsFromFlags(&game_options_, &player_options_);
 
     int num_games = FLAGS_parallel_games;
-    for (int thread_id = 0; thread_id < num_games; ++thread_id) {
+    int instance_id = FLAGS_instance_id;
+    int thread_id_begin = instance_id*num_games;
+    for (int thread_id = thread_id_begin;
+             thread_id < thread_id_begin+num_games; ++thread_id) {
       bool swap_models = (thread_id & 1) != 0;
       threads_.emplace_back(std::bind(&Evaluator::ThreadRun, this, thread_id,
                                       swap_models ? &model_b : &model_a,
